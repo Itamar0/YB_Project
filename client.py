@@ -42,16 +42,18 @@ IFF_TUN = 0x0001
 IFF_TAP = 0x0002
 IFF_NO_PI = 0x1000
 
-# VPN configuration
-VPN_MTU = 1500  # Maximum transmission unit for VPN packets
+# VPN configuration 
+VPN_MTU = 1400  # Reduced from 1500 to account for VPN encapsulation
+VPN_MSS = 1340  # MSS should be lower than MTU (MTU - IP header - TCP header)
 KEEPALIVE_INTERVAL = 25  # Seconds
 CLIENT_TIMEOUT = 90  # Seconds
 
-SERVER_ADRESS = "192.168.68.118"
+SERVER_ADRESS = "10.68.121.209"
 SERVER_PORT = 1194
 
+
 class VPNClient:
-    def __init__(self, address="0.0.0.0", port=1193):
+    def __init__(self, address="0.0.0.0", port=1193, external_interface="ens33"):
 
         self.bind_address = address
         self.port = port
@@ -59,7 +61,7 @@ class VPNClient:
         self.server_address = SERVER_ADRESS
         self.server_port = SERVER_PORT
 
-        self.network_interface = None
+        self.external_interface = external_interface
         self.virtual_interface = None
 
         self.virtual_ip = None
@@ -95,6 +97,51 @@ class VPNClient:
         self.connected_event = threading.Event()
         self.authenticated_event = threading.Event()
 
+    def _subnet_mask_to_cidr(self, subnet_mask):
+        """Convert a subnet mask (e.g. 255.255.255.0) to CIDR prefix length (e.g. 24)"""
+        try:
+            octets = subnet_mask.split('.')
+            if len(octets) != 4:
+                logger.warning(f"Invalid subnet mask format: {subnet_mask}, using default /24")
+                return 24
+                
+            bit_count = 0
+            for octet in octets:
+                octet_int = int(octet)
+                # Count the number of 1 bits in this octet
+                while octet_int:
+                    bit_count += octet_int & 1
+                    octet_int >>= 1
+                    
+            return bit_count
+        except Exception as e:
+            logger.error(f"Error converting subnet mask to CIDR: {e}")
+            return 24  # Default to /24 on error
+        
+    def _get_external_ip(self):
+        """Get the IP address of the server's external interface"""
+        try:    
+            # Run the ip command to get the interface IP
+            result = subprocess.run(
+                f"ip addr show {self.external_interface} | grep 'inet ' | awk '{{print $2}}' | cut -d/ -f1",
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            
+            if result.returncode == 0 and result.stdout.strip():
+                ip = result.stdout.strip()
+                logger.info(f"External interface {self.external_interface} has IP: {ip}")
+                return ip
+            else:
+                logger.error(f"Failed to get IP for interface {self.external_interface}")
+                logger.error(f"Command output: {result.stderr}")
+                return "127.0.0.1"
+        except Exception as e:
+            logger.error(f"Error getting external IP: {e}")
+            return "127.0.0.1"
+
     def _set_up_tun(self):
         """Set up the TUN interface"""
         try:
@@ -105,7 +152,7 @@ class VPNClient:
             logger.error(f"Failed to load TUN module: {e}")
             logger.error("Please make sure the TUN module is available")
             sys.exit(1)
-            
+                
         try:
             # Open TUN device file
             self.tun_fd = os.open("/dev/net/tun", os.O_RDWR)
@@ -121,10 +168,225 @@ class VPNClient:
             flags = fcntl.fcntl(self.tun_fd, fcntl.F_GETFL)
             fcntl.fcntl(self.tun_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
             
+            # Disable all TCP offloading features that can interfere with tunneled traffic
+            os.system(f"ethtool -K {self.virtual_interface} rx off tx off sg off tso off ufo off gso off gro off lro off 2>/dev/null || true")
+            if self.external_interface:
+                os.system(f"ethtool -K {self.external_interface} tso off gso off 2>/dev/null || true")
+                os.system(f"ethtool -K {self.external_interface} tx-checksum-ip-generic off 2>/dev/null || true")
+            
+            # Add comprehensive offloading disabling to ensure it's properly disabled
+            self._ensure_client_offloading_disabled()
+            
             logger.info(f"TUN interface '{self.virtual_interface}' created")
             
         except Exception as e:
             logger.error(f"Failed to set up TUN interface: {e}")
+            raise
+
+    def _ensure_client_offloading_disabled(self):
+        """
+        Ensure all offloading features are properly disabled on client interfaces
+        with verification and no silent failures
+        """
+        logger.info("Ensuring complete offloading disabling for client...")
+        
+        # Features that might be silently failing with "|| true" in the original code
+        essential_features = [
+            "rx", "tx", "sg", "tso", "ufo", "gso", "gro", "lro"
+        ]
+        
+        # Additional features that should be disabled on client
+        additional_features = [
+            "tx-checksum-ip-generic", "rx-checksum", "tx-checksum-ipv4",
+            "tx-checksum-ipv6", "tx-nocache-copy", "rx-gro-hw"
+        ]
+        
+        # Critical: Ensure proper disabling on virtual interface
+        if self.virtual_interface:
+            logger.info(f"Ensuring offloading features disabled on {self.virtual_interface}...")
+            
+            # First try combined disabling for essential features (no || true)
+            essential_str = " ".join([f"{f} off" for f in essential_features])
+            result = os.system(f"ethtool -K {self.virtual_interface} {essential_str} 2>/dev/null")
+            
+            # If combined fails, try individual disabling with verification
+            if result != 0:
+                for feature in essential_features:
+                    cmd = f"ethtool -K {self.virtual_interface} {feature} off"
+                    result = os.system(cmd)
+                    if result != 0:
+                        logger.warning(f"Failed to disable {feature} on {self.virtual_interface}")
+            
+            # Additional features
+            for feature in additional_features:
+                os.system(f"ethtool -K {self.virtual_interface} {feature} off 2>/dev/null")
+            
+            # Verify settings
+            try:
+                output = subprocess.check_output(
+                    f"ethtool -k {self.virtual_interface} | grep -E 'tcp-segmentation-offload|generic-segmentation-offload|tx-checksumming|rx-checksumming'", 
+                    shell=True, stderr=subprocess.PIPE, text=True
+                )
+                logger.info(f"Virtual interface offloading status:\n{output.strip()}")
+            except Exception as e:
+                logger.warning(f"Could not verify offloading settings on {self.virtual_interface}: {e}")
+        
+        # Critical: The external interface needs more disabling than original code provides
+        if self.external_interface:
+            logger.info(f"Ensuring sufficient offloading disabled on {self.external_interface}...")
+            
+            # External interface needs more features disabled than in original code
+            external_features = [
+                "tso", "gso", "tx-checksum-ip-generic", "tx-checksum-ipv4", 
+                "tx-checksum-ipv6", "rx-checksum", "sg"
+            ]
+            
+            for feature in external_features:
+                cmd = f"ethtool -K {self.external_interface} {feature} off"
+                result = os.system(cmd)
+                if result != 0:
+                    logger.warning(f"Failed to disable {feature} on {self.external_interface}")
+            
+            # Verify settings
+            try:
+                output = subprocess.check_output(
+                    f"ethtool -k {self.external_interface} | grep -E 'tcp-segmentation-offload|generic-segmentation-offload|tx-checksumming|rx-checksumming'", 
+                    shell=True, stderr=subprocess.PIPE, text=True
+                )
+                logger.info(f"External interface offloading status:\n{output.strip()}")
+            except Exception as e:
+                logger.warning(f"Could not verify offloading settings on {self.external_interface}: {e}")
+        
+        # Client-specific kernel parameters (only ones not already in _setup_client_nat)
+        client_params = {
+            "net.ipv4.tcp_mtu_probing": "1",       # Enable MTU probing
+            "net.ipv4.tcp_timestamps": "1",        # Important for accurate RTT calculation
+            "net.ipv4.tcp_thin_dupack": "1",       # Better retransmit for thin streams
+            "net.ipv4.tcp_early_retrans": "1"      # Faster recovery from packet loss
+        }
+        
+        for param, value in client_params.items():
+            os.system(f"sysctl -w {param}={value} 2>/dev/null")
+        
+        # Force rp_filter again (critical for client)
+        if self.virtual_interface:  
+            os.system(f"sysctl -w net.ipv4.conf.{self.virtual_interface}.rp_filter=0")
+        os.system("sysctl -w net.ipv4.conf.all.rp_filter=0")
+        os.system("sysctl -w net.ipv4.conf.default.rp_filter=0")
+        
+        logger.info("Client offloading and TCP parameters verification complete")
+
+    def _force_tcp_checksum_recalculation(self, packet_data):
+        """
+        Force checksum recalculation for TCP packets
+        This is critical for fixing the checksum mismatch issues
+        """
+        try:
+            # Parse the IP packet
+            ip_packet = IP(packet_data)
+            
+            # If this is a TCP packet, recalculate checksums
+            if TCP in ip_packet:
+                # Delete checksums to force recalculation
+                del ip_packet[TCP].chksum
+                del ip_packet.chksum
+                
+                # Rebuild the packet with recalculated checksums
+                return bytes(ip_packet)
+            
+            # For non-TCP packets, return original data
+            return packet_data
+            
+        except Exception as e:
+            logger.warning(f"Error in checksum recalculation: {e}, using original packet")
+            return packet_data
+
+    def _setup_client_nat(self):
+        """Set up NAT and routing for the VPN client"""
+        try:
+            # Enable IP forwarding
+            os.system("echo 1 > /proc/sys/net/ipv4/ip_forward")
+            
+            # Get subnet from virtual IP and mask
+            cidr_prefix = self._subnet_mask_to_cidr(self.subnet_mask)
+            vpn_subnet = f"{self.server_virtual_ip}/{cidr_prefix}"
+            
+            # Clear existing rules that might conflict
+            os.system("ip rule flush")
+            os.system("ip route flush table 200")
+            
+            # Add default rules back
+            os.system("ip rule add from all lookup main pref 32766")
+            os.system("ip rule add from all lookup default pref 32767")
+            
+            # Create VPN routing table
+            # Default route via VPN server's virtual IP
+            os.system(f"ip route add default via {self.server_virtual_ip} dev {self.virtual_interface} table 200")
+            
+            # Add route for the entire VPN subnet in both main and VPN tables
+            os.system(f"ip route add {vpn_subnet} dev {self.virtual_interface}")
+            os.system(f"ip route add {vpn_subnet} dev {self.virtual_interface} table 200")
+            
+            # Make sure traffic to the VPN server's real IP goes through physical interface
+            os.system(f"ip rule add to {self.server_address}/32 table main")
+            
+            # *** CRITICAL FOR RETURN TRAFFIC ***
+            # This ensures packets FOR our virtual IP arrive correctly
+            os.system(f"ip rule add to {self.virtual_ip}/32 table main")
+            
+            # Route traffic FROM our virtual IP through the VPN
+            os.system(f"ip rule add from {self.virtual_ip} table 200")
+            
+            # Enable connection tracking and state management
+            os.system("sysctl -w net.netfilter.nf_conntrack_max=65536 2>/dev/null || sysctl -w net.nf_conntrack_max=65536 2>/dev/null")
+            os.system("sysctl -w net.ipv4.tcp_sack=1")
+            os.system("sysctl -w net.ipv4.tcp_window_scaling=1")
+            
+            # Set up iptables MSS clamping for TCP connections
+            # Clear existing rules
+            os.system("iptables -t mangle -F POSTROUTING 2>/dev/null || true")
+            os.system("iptables -t mangle -F OUTPUT 2>/dev/null || true")
+            
+            # Add MSS clamping rules to ensure TCP connections work
+            os.system(f"iptables -t mangle -A POSTROUTING -o {self.virtual_interface} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {VPN_MSS}")
+            os.system(f"iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {VPN_MSS}")
+            os.system(f"iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu")
+            
+            # *** ADDED: ENSURE PROPER CONNECTION TRACKING ***
+            # Accept established and related connections
+            os.system(f"iptables -A INPUT -i {self.virtual_interface} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT")
+            os.system(f"iptables -A OUTPUT -o {self.virtual_interface} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT")
+            
+            # Accept all traffic on the TUN interface
+            os.system(f"iptables -A INPUT -i {self.virtual_interface} -j ACCEPT")
+            os.system(f"iptables -A OUTPUT -o {self.virtual_interface} -j ACCEPT")
+            
+            # Enable Path MTU Discovery
+            os.system("sysctl -w net.ipv4.ip_no_pmtu_disc=0")
+            
+            # Disable ICMP redirects
+            os.system("sysctl -w net.ipv4.conf.all.send_redirects=0")
+            os.system("sysctl -w net.ipv4.conf.all.accept_redirects=0")
+            
+            # *** CRITICAL: Disable reverse path filtering on the VPN interface ***
+            # This ensures packets with "asymmetric routing" aren't dropped
+            os.system(f"sysctl -w net.ipv4.conf.{self.virtual_interface}.rp_filter=0")
+            os.system("sysctl -w net.ipv4.conf.all.rp_filter=0")
+            
+            # Verify configuration
+            route_table = os.popen("ip route").read()
+            logger.info(f"Routing table:\n{route_table}")
+            
+            routing_rules = os.popen("ip rule list").read()
+            logger.info(f"Routing rules:\n{routing_rules}")
+            
+            mss_rules = os.popen("iptables -t mangle -L -v -n").read()
+            logger.info(f"MSS clamping rules:\n{mss_rules}")
+            
+            logger.info("Client routing and NAT configured properly")
+            
+        except Exception as e:
+            logger.error(f"Failed to set up client NAT: {e}")
             raise
 
     def _configure_tun(self, config):
@@ -136,26 +398,67 @@ class VPNClient:
             self.dns_servers = config['dns_servers']
             self.routes = config['routes']
             self.VPN_MTU = config['mtu']
+
+            cidr_prefix = self._subnet_mask_to_cidr(self.subnet_mask)
+            logger.info(f"Converted subnet mask {self.subnet_mask} to CIDR prefix /{cidr_prefix}")
             
+            # Configure interface
             os.system(f"ip link set dev {self.virtual_interface} up")
-            os.system(f"ip addr add {self.virtual_ip}/24 dev {self.virtual_interface}")
+            os.system(f"ip addr add {self.virtual_ip}/{cidr_prefix} dev {self.virtual_interface}")
             os.system(f"ip link set dev {self.virtual_interface} mtu {self.VPN_MTU}")
+
+            # Setup NAT and routing
+            self._setup_client_nat()
             
+            # Add routes
             for route in self.routes:
-                os.system(f"ip route add {route} dev {self.virtual_interface}")
+                if route == '0.0.0.0/0':
+                    # Default route needs a gateway
+                    os.system(f"ip route add default via {self.server_virtual_ip} dev {self.virtual_interface} metric 10")
+                else:
+                    # Other routes can be added without gateway
+                    os.system(f"ip route add {route} dev {self.virtual_interface}")
             
-            resolv_conf = ""
-            for dns in self.dns_servers:
-                resolv_conf += f"nameserver {dns}\n"
-                
-            # This is a simplified approach - in a real implementation you might want
-            # to modify the system's resolv.conf or use resolvconf/NetworkManager
+            # Configure DNS resolution
+            # First backup the existing resolv.conf
+            os.system("cp /etc/resolv.conf /etc/resolv.conf.vpn_backup")
             
-            logger.info(f"TUN interface configured with IP {self.virtual_ip}")
+            # Create a new resolv.conf with the VPN DNS servers
+            with open('/etc/resolv.conf', 'w') as f:
+                for dns in self.dns_servers:
+                    f.write(f"nameserver {dns}\n")
+            
+            # Restart nscd if it exists (DNS cache daemon)
+            os.system("systemctl restart nscd 2>/dev/null || service nscd restart 2>/dev/null || true")
+            
+            logger.info(f"TUN interface configured with IP {self.virtual_ip} and MTU {self.VPN_MTU}")
+            logger.info(f"DNS servers: {', '.join(self.dns_servers)}")
             
         except Exception as e:
             logger.error(f"Failed to configure TUN interface: {e}")
             raise
+
+    def _cleanup_client_nat(self):
+        """Clean up client NAT rules"""
+        try:
+            # Remove MASQUERADE rule
+            os.system(f"iptables -t nat -D POSTROUTING -o {self.external_interface} -j MASQUERADE")
+            
+            # Remove SNAT rule
+            os.system(f"iptables -t nat -D POSTROUTING -s {self.external_interface_ip} -o {self.virtual_interface} -j SNAT --to-source {self.virtual_ip}")
+            
+            # Remove forwarding rules
+            os.system(f"iptables -D FORWARD -i {self.external_interface} -o {self.virtual_interface} -j ACCEPT")
+            os.system(f"iptables -D FORWARD -i {self.virtual_interface} -o {self.external_interface} -j ACCEPT")
+            
+            # Remove packet marking
+            os.system(f"iptables -t mangle -D OUTPUT -d {self.server_address} -j MARK --set-mark 1")
+            os.system("ip rule del fwmark 1 table 100")
+            os.system("ip route flush table 100")
+            
+            logger.info("Client NAT cleanup complete")
+        except Exception as e:
+            logger.error(f"Error cleaning up client NAT: {e}")
 
     def _shutdown_tun(self):
         """Clean up the TUN interface"""
@@ -182,13 +485,17 @@ class VPNClient:
             logger.error(f"Error shutting down TUN interface: {e}")
 
     def _set_up_socket(self):
-        """Set up the UDP socket for communication"""
         try:
             self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            
+            # Increase socket buffer sizes for better performance
+            self.client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)  # 1MB receive buffer
+            self.client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)  # 1MB send buffer
+            
             self.client_socket.settimeout(0.1)  # Set a timeout for recvfrom
             self.client_socket.bind((self.bind_address, self.port))
-            logger.info(f"Socket bound to {self.bind_address}:{self.port}")
+            logger.info(f"Socket bound to {self.bind_address}:{self.port} with 1MB buffers")
         except socket.error as e:
             logger.error(f"Socket error: {e}")
             raise
@@ -211,6 +518,10 @@ class VPNClient:
         
         try:
             self.msg_handler = MessageHandler('client')
+
+            self.external_interface_ip = self._get_external_ip()
+
+            logger.info(f"Using real IP address: {self.external_interface_ip}")
 
             self._set_up_tun()
             self._set_up_socket()
@@ -253,6 +564,23 @@ class VPNClient:
                 thread.join(timeout=2)
                 if thread.is_alive():
                     logger.warning(f"Thread {thread.name} did not terminate gracefully")
+        
+        # Clean up iptables rules
+        os.system(f"iptables -t mangle -D POSTROUTING -o {self.virtual_interface} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {VPN_MSS} 2>/dev/null || true")
+        os.system(f"iptables -t mangle -D OUTPUT -o {self.virtual_interface} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {VPN_MSS} 2>/dev/null || true")
+        
+        # Restore original DNS configuration
+        if os.path.exists("/etc/resolv.conf.vpn_backup"):
+            os.system("mv /etc/resolv.conf.vpn_backup /etc/resolv.conf")
+            logger.info("Restored original DNS configuration")
+        
+        # Clean up routing
+        if self.virtual_interface:
+            try:
+                os.system(f"ip rule del from {self.virtual_ip} table 200 2>/dev/null || true")
+                os.system(f"ip route flush table 200 2>/dev/null || true")
+            except:
+                pass
         
         self._shutdown_tun()
         self._shutdown_socket()
@@ -297,13 +625,7 @@ class VPNClient:
         
         while self.running.is_set():
             try:
-                # Check if we need to retransmit any packets
-                retransmissions = self.msg_handler.check_retransmissions()
-                for seq_num, packet in retransmissions:
-                    self.udp_write_queue.put(packet)
-                    logger.debug(f"Queued retransmission of packet {seq_num} to server")
-                    
-                    
+
                 data, addr = self.udp_read_queue.get(timeout=0.1)
                 server_ip, server_port = addr
                 
@@ -317,7 +639,7 @@ class VPNClient:
                 packet_info = self.msg_handler.process_packet(data)
                 
                 if 'error' in packet_info:
-                    logger.warning(f"Invalid packet from server: {packet_info['error']}")
+                    logger.debug(f"Invalid packet from server: {packet_info['error']}")
                     self.udp_read_queue.task_done()
                     continue
                 
@@ -350,7 +672,7 @@ class VPNClient:
                     pass
                     
                 elif msg_type == MsgType.Retransmit:
-                    self._handle_retransmit(packet_info)
+                    pass
                     
                 elif msg_type == MsgType.Mtu:
                     self._handle_mtu(packet_info)
@@ -413,6 +735,9 @@ class VPNClient:
         """Worker thread to read from TUN interface and forward to the VPN server"""
         logger.info("TUN read worker started")
         
+        packet_counter = 0
+        last_stats = time.time()
+        
         while self.running.is_set():
             try:
                 if self.connection_state == ConnectionState.CONNECTED and self.tun_fd is not None:
@@ -420,11 +745,18 @@ class VPNClient:
                         packet = os.read(self.tun_fd, self.VPN_MTU)
                         
                         if packet:
+                            
+                            # Process the packet
                             processed_packet = self._process_outbound_packet(packet)
                             
                             if processed_packet:
+                                # Create VPN data packet
                                 data_packet = self.msg_handler.create_data_packet(processed_packet)
+
+                                processed_packet = IP(processed_packet)
+                                logger.info(f"Sending packet to server: {processed_packet.summary()}")
                                 
+                                # Queue for sending to the server
                                 self.udp_write_queue.put(data_packet)
                                 
                     except BlockingIOError:
@@ -658,47 +990,176 @@ class VPNClient:
             self.connection_state = ConnectionState.ERROR
 
     def _handle_data(self, packet_info):
+        """Handle data packets from the server"""
         try:
             encapsulated_data = packet_info['payload']
-        
             if not encapsulated_data:
                 logger.warning(f"Empty data packet from Server")
                 return
-                
+            
+            # Parse the packet for processing and logging
             try:
                 ip_packet = IP(encapsulated_data)
                 
-                logger.info(f"Packet details:\n")
-                logger.info(ip_packet.show())
+                # Track if packet needs modification
+                modified = False
+                
+                # Validate the destination is actually our virtual IP
+                # Don't modify destination - it might be broadcast or multicast traffic
+                if ip_packet.dst != self.virtual_ip and not ip_packet.dst.startswith('255.'):
+                    logger.warning(f"Received packet destined for {ip_packet.dst} but our VPN IP is {self.virtual_ip}")
+                
+                # Ensure TTL is reasonable to prevent premature packet drops
+                if ip_packet.ttl < 10:
+                    ip_packet.ttl = 64
+                    logger.debug(f"Adjusted TTL to 64 for packet from {ip_packet.src} to {ip_packet.dst}")
+                    modified = True
+                
+                # Special handling for TCP packets
+                if TCP in ip_packet:
+                    tcp_packet = ip_packet[TCP]
+                    
+                    # Check if it's a SYN packet with an MSS option
+                    if tcp_packet.flags & 0x02:  # SYN flag
+                        for i, option in enumerate(tcp_packet.options):
+                            if option[0] == 'MSS':
+                                current_mss = option[1]
+                                if current_mss > VPN_MSS:
+                                    # Update the MSS option
+                                    new_options = list(tcp_packet.options)
+                                    new_options[i] = ('MSS', VPN_MSS)
+                                    tcp_packet.options = new_options
+                                    modified = True
+                                    logger.info(f"Updated SYN packet MSS from {current_mss} to {VPN_MSS}")
+                    
+                    # Log TCP-specific details
+                    tcp_flags = tcp_packet.flags
+                    flag_str = []
+                    if tcp_flags & 0x02: flag_str.append("SYN")
+                    if tcp_flags & 0x10: flag_str.append("ACK")
+                    if tcp_flags & 0x01: flag_str.append("FIN")
+                    if tcp_flags & 0x04: flag_str.append("RST")
+                    flag_str = "-".join(flag_str) if flag_str else "None"
+                    
+                    logger.info(f"Received TCP packet: {ip_packet.src}:{tcp_packet.sport} -> "
+                            f"{ip_packet.dst}:{tcp_packet.dport} [Flags: {flag_str}]")
+                    
+                    # Force checksum recalculation for ALL TCP packets
+                    packet_to_write = self._force_tcp_checksum_recalculation(encapsulated_data)
+                else:
+                    # If packet was modified, recalculate checksums
+                    if modified:
+                        # Delete existing checksums to force recalculation
+                        if UDP in ip_packet:
+                            del ip_packet[UDP].chksum
+                        del ip_packet.chksum
+                        
+                        # Rebuild the packet to recalculate checksums
+                        packet_to_write = bytes(ip_packet)
+                    else:
+                        # Use original packet if no modifications
+                        packet_to_write = encapsulated_data
+                    
+                    logger.info(f"Received data packet from server: {ip_packet.summary()}")
+                
+                # Write to TUN interface
+                os.write(self.tun_fd, packet_to_write)
+                
             except Exception as e:
-                logger.error(f"Error processing IP packet: {e}")
-                logger.error(traceback.format_exc())
+                logger.warning(f"Error parsing/modifying packet: {e}")
+                # Still try to write the original packet
+                os.write(self.tun_fd, encapsulated_data)
+                
         except Exception as e:
             logger.error(f"Error handling data packet: {e}")
-            return
+            import traceback
+            logger.error(traceback.format_exc())
 
     def _process_outbound_packet(self, packet):
         """Process an outbound packet before sending it through the VPN"""
         try:
+            # Parse the packet
             ip_packet = IP(packet)
             
-            if ip_packet.src == '0.0.0.0' or self._is_unspecified_ip(ip_packet.src):
+            # Track if packet needs modification
+            modified = False
+            
+            # Ensure source IP is correct
+            if ip_packet.src != self.virtual_ip and not self._is_unspecified_ip(ip_packet.src):
                 ip_packet.src = self.virtual_ip
-                logger.debug(f"Replaced unspecified source IP with VPN IP {self.virtual_ip}")
+                modified = True
+                logger.debug(f"Corrected source IP to {self.virtual_ip}")
             
-            del ip_packet.chksum
-
-            if ip_packet.haslayer(TCP):
-                del ip_packet[TCP].chksum
-            elif ip_packet.haslayer(UDP):
-                del ip_packet[UDP].chksum
-
-            logger.info(ip_packet.show())
+            # Make sure TTL is reasonable
+            if ip_packet.ttl < 10:
+                ip_packet.ttl = 64
+                modified = True
+                logger.debug(f"Adjusted TTL to 64 for outbound packet")
             
-            return bytes(ip_packet)
+            # Special TCP handling for all TCP packets
+            if TCP in ip_packet:
+                tcp_packet = ip_packet[TCP]
+                
+                # Handle MSS in SYN packets
+                if tcp_packet.flags & 0x02:  # SYN flag
+                    mss_value = None
+                    for i, option in enumerate(tcp_packet.options):
+                        if option[0] == 'MSS':
+                            mss_value = option[1]
+                            if mss_value > VPN_MSS:
+                                # Update the MSS option
+                                new_options = list(tcp_packet.options)
+                                new_options[i] = ('MSS', VPN_MSS)
+                                tcp_packet.options = new_options
+                                modified = True
+                                logger.info(f"Updated outbound SYN packet MSS from {mss_value} to {VPN_MSS}")
+                    
+                    logger.info(f"Outbound TCP SYN: {ip_packet.src}:{tcp_packet.sport} -> {ip_packet.dst}:{tcp_packet.dport} (MSS: {mss_value})")
+                elif tcp_packet.flags & 0x04:  # RST flag
+                    logger.info(f"Outbound TCP RST: {ip_packet.src}:{tcp_packet.sport} -> {ip_packet.dst}:{tcp_packet.dport}")
+                elif tcp_packet.flags & 0x01:  # FIN flag
+                    logger.info(f"Outbound TCP FIN: {ip_packet.src}:{tcp_packet.sport} -> {ip_packet.dst}:{tcp_packet.dport}")
+                else:
+                    logger.debug(f"Outbound TCP: {ip_packet.src}:{tcp_packet.sport} -> {ip_packet.dst}:{tcp_packet.dport} flags={tcp_packet.flags}")
+                
+                # Always force checksum recalculation for TCP packets
+                return self._force_tcp_checksum_recalculation(packet if not modified else bytes(ip_packet))
+            
+            # For non-TCP packets, if modified, recalculate checksums
+            if modified:
+                # Delete existing checksums to force recalculation
+                if UDP in ip_packet:
+                    del ip_packet[UDP].chksum
+                del ip_packet.chksum
+                
+                # Rebuild the packet with recalculated checksums
+                return bytes(ip_packet)
+            else:
+                # Return original packet if no modifications
+                return packet
+                
         except Exception as e:
             logger.error(f"Error processing outbound packet: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            # Return original packet if there was an error in processing
             return packet
+        
+    def _get_port(self, packet):
+        """Helper method to get the source port from a packet"""
+        if packet.haslayer(TCP):
+            return packet[TCP].sport
+        elif packet.haslayer(UDP):
+            return packet[UDP].sport
+        return None
+
+    def _get_dst_port(self, packet):
+        """Helper method to get the destination port from a packet"""
+        if packet.haslayer(TCP):
+            return packet[TCP].dport
+        elif packet.haslayer(UDP):
+            return packet[UDP].dport
+        return None
     
     def _is_unspecified_ip(self, ip_str):
         """Check if the IP address is unspecified (0.0.0.0) or invalid"""
@@ -760,9 +1221,7 @@ class VPNClient:
             
             logger.info(f"Server requested disconnection: {reason}")
             
-            # Send acknowledgment for the disconnect packet
-            ack_packet = self.msg_handler.create_ack_packet(packet_info['seq_num'])
-            self.udp_write_queue.put(ack_packet)
+            # [RELIABILITY REMOVED] No more sending ACK packets
             
             # Update connection state
             self.connection_state = ConnectionState.DISCONNECTED
