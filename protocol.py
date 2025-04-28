@@ -11,6 +11,15 @@ import zlib
 import os
 import logging
 import queue
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.exceptions import InvalidSignature
+import os
+import base64
+import hmac
+import hashlib
 from enum import Enum
 from typing import Dict, Tuple, Optional, List, Any, Union
 try:
@@ -39,6 +48,19 @@ MAX_PACKET_SIZE = 1472  # Maximum UDP payload size (avoiding fragmentation)
 ACK_TIMEOUT = 2.0  # Timeout for acknowledgments in seconds
 BUFFER_CLEANUP_INTERVAL = 30.0  # Seconds between buffer cleanup
 MAX_BUFFER_AGE = 60.0  # Maximum age of buffered packets in seconds
+
+# Security constants
+CIPHER_SUITE_AES_256_GCM = 1
+KEY_EXCHANGE_ECDHE = 1
+AUTH_METHOD_PSK = 1
+AUTH_METHOD_CERTIFICATE = 2
+
+# Crypto parameters
+AES_KEY_SIZE = 32  # 256 bits
+HMAC_KEY_SIZE = 32  # 256 bits
+NONCE_SIZE = 12     # 96 bits for GCM
+EC_CURVE = ec.SECP384R1()  # P-384 curve
+KEY_ROTATION_INTERVAL = 3600  # Rotate keys every hour
 
 
 class MsgType(Enum):
@@ -83,7 +105,7 @@ class ConnectionState(Enum):
 class MessageHandler():
     """Handles the creation, parsing, and tracking of protocol messages"""
     
-    def __init__(self, role, client_id=None):
+    def __init__(self, role, client_id=None, psk=None, cert_path=None, key_path=None):
         """
         Initialize the message handler
         
@@ -100,15 +122,9 @@ class MessageHandler():
         self.next_seq_num = random.randint(1, 10000)
         self.expected_seq_num = 0
         
-        # Reliability tracking
-        self.unacked_packets = {}  # seq_num -> (packet, timestamp, retry_count)
-        self.retransmit_queue = []  # List of (seq_num, packet) to retransmit
-        self.last_retransmit_check = time.time()
-        self.last_buffer_cleanup = time.time()
-        
         # For the server to track multiple clients
         self.client_seq_nums = {}  # addr -> {'seq': next_seq, 'expected': expected_seq}
-        self.seq_to_client = {}    # seq_num -> addr (for retransmission tracking)
+        self.seq_to_client = {}    # seq_num -> addr (for message routing)
         
         # MTU discovery
         self.current_mtu = MAX_PACKET_SIZE
@@ -122,7 +138,6 @@ class MessageHandler():
     def _generate_client_id(self) -> str:
         """Generate a unique client ID"""
         return hashlib.md5(str(time.time() + random.random()).encode()).hexdigest()[:8]
-    
 
     def _calculate_checksum(self, data: bytes) -> int:
         """Calculate CRC32 checksum for packet data"""
@@ -153,52 +168,8 @@ class MessageHandler():
             if now - timestamp > MAX_BUFFER_AGE:
                 del self.packet_buffer[key]
                 logger.debug(f"Removed stale buffered packet {key}")
-        
-        # Clean up old sequence tracking for disconnected clients
-        if self.role == 'server':
-            # This would ideally be synchronized with client cleanup in the server
-            pass
-
-    def check_retransmissions(self) -> List[Tuple[int, bytes]]:
-        """
-        Check for packets that need retransmission and prepare them
-        
-        Returns:
-            List of (seq_num, packet) tuples that need to be retransmitted
-        """
-        now = time.time()
-        self.retransmit_queue = []
-        
-        # Only check periodically to avoid excessive processing
-        if now - self.last_retransmit_check < 0.2:
-            return []
-            
-        self.last_retransmit_check = now
-        
-        # Clean up stale buffers
-        self._cleanup_buffers()
-
-        if self.retransmit_queue:
-            logger.debug(f"Scheduled {len(self.retransmit_queue)} packets for retransmission: {[seq for seq, _ in self.retransmit_queue]}")
-        
-        # Find packets that need retransmission
-        for seq_num, (packet, timestamp, retry_count) in list(self.unacked_packets.items()):
-            if now - timestamp > ACK_TIMEOUT * (2 ** retry_count):
-                if retry_count >= MAX_RETRIES:
-                    # Max retries reached, remove packet and log error
-                    logger.error(f"Max retries reached for packet {seq_num}")
-                    del self.unacked_packets[seq_num]
-                    # Clean up sequence tracking
-                    if seq_num in self.seq_to_client:
-                        del self.seq_to_client[seq_num]
-                else:
-                    # Schedule for retry
-                    self.retransmit_queue.append((seq_num, packet))
-                    # Update retry count
-                    self.unacked_packets[seq_num] = (packet, now, retry_count + 1)
-        
-        return self.retransmit_queue
     
+    # [RELIABILITY REMOVED] No more check_retransmissions method
 
     def _create_header(self, msg_type: MsgType, seq_num: int, 
                        ack_num: int = 0, flags: int = 0, payload_length: int = 0) -> bytes:
@@ -261,9 +232,7 @@ class MessageHandler():
         # Add checksum to packet
         packet = packet_data + struct.pack('>I', checksum)
         
-        # For reliability - store packets that expect ACK in the unacked_packets dict
-        if msg_type not in [MsgType.Ack, MsgType.KeepAlive]:
-            self.unacked_packets[seq_num] = (packet, time.time(), 0)
+        # [RELIABILITY REMOVED] No more tracking of unacked packets
         
         return packet
     
@@ -326,15 +295,7 @@ class MessageHandler():
                 'payload': payload  
             }
             
-            if flags & PacketFlags.ACK.value:
-                if ack_num in self.unacked_packets:
-                    logger.debug(f"Processing ACK for sequence {ack_num}, removing from unacked packets")
-                    del self.unacked_packets[ack_num]
-                    # Clean up sequence tracking
-                    if ack_num in self.seq_to_client:
-                        del self.seq_to_client[ack_num]
-                else:
-                    logger.debug(f"Received ACK for unknown sequence {ack_num}")
+            # [RELIABILITY REMOVED] No more processing of ACK flags
             
             return result
             
@@ -375,12 +336,7 @@ class MessageHandler():
                 # Store out-of-order packet
                 self.packet_buffer[packet_info['seq_num']] = (packet_data, time.time())
                 
-                # Request retransmission of missing packets
-                retransmit_request = {
-                    'action': 'retransmit',
-                    'seq_num': expected
-                }
-                return {**packet_info, **retransmit_request}
+                # [RELIABILITY REMOVED] No more retransmission requests
         elif self.role == 'server' and sender_addr in self.client_seq_nums:
             expected = self.client_seq_nums[sender_addr]['expected']
             if packet_info['seq_num'] > expected:
@@ -389,12 +345,7 @@ class MessageHandler():
                 buffer_key = f"{client_addr_str}_{packet_info['seq_num']}"
                 self.packet_buffer[buffer_key] = (packet_data, time.time())
                 
-                # Request retransmission of missing packets
-                retransmit_request = {
-                    'action': 'retransmit',
-                    'seq_num': expected
-                }
-                return {**packet_info, **retransmit_request}
+                # [RELIABILITY REMOVED] No more retransmission requests
         
         # Update expected sequence number
         if self.role == 'client':
@@ -402,23 +353,7 @@ class MessageHandler():
         elif self.role == 'server' and sender_addr in self.client_seq_nums:
             self.client_seq_nums[sender_addr]['expected'] = packet_info['seq_num'] + 1
         
-        # Send acknowledgment for packets that need it
-        if packet_info['type'] not in [MsgType.Ack, MsgType.KeepAlive]:
-            ack_packet = self.create_ack_packet(packet_info['seq_num'], client_addr=sender_addr)
-            if self.role == 'server' and sender_addr:
-                if self.packet_send_callback:
-                    try:
-                        # For server, send to specific client. For client, sender_addr is ignored
-                        self.packet_send_callback(ack_packet, sender_addr)
-                    except Exception as e:
-                        logger.error(f"Error in packet send callback: {e}")
-            if self.role == 'client':
-                if self.packet_send_callback:
-                    try:
-                        # For client, send to server
-                        self.packet_send_callback(ack_packet)
-                    except Exception as e:
-                        logger.error(f"Error in packet send callback: {e}")
+        # [RELIABILITY REMOVED] No more sending acknowledgment for packets
         
         # Return processed packet info with default action
         return {**packet_info, 'action': 'process'}
@@ -612,4 +547,3 @@ class MessageHandler():
         
         return self.create_packet(MsgType.Mtu, payload, 
                                 flags=PacketFlags.MTU.value, client_addr=client_addr)
-
