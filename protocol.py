@@ -1,36 +1,15 @@
 # Description: This file contains the protocol definition for the VPN server and client.
 import json
-import sys
 import time
 import struct
 import hashlib
 import random
-import socket
-import threading
 import zlib
-import os
 import logging
-import queue
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.exceptions import InvalidSignature
-import os
-import base64
-import hmac
 import hashlib
+from crypto import VPNCrypto
 from enum import Enum
-from typing import Dict, Tuple, Optional, List, Any, Union
-try:
-    from scapy.all import Raw
-    from scapy.layers.inet import ICMP, TCP, UDP, IP
-    from scapy.layers.l2 import Ether
-    from scapy.packet import Packet
-except ImportError:
-    print("Please install the required dependencies:")
-    print("pip install scapy")
-    sys.exit(1)
+from typing import Optional
 
 # Set up logging
 logging.basicConfig(
@@ -49,19 +28,6 @@ ACK_TIMEOUT = 2.0  # Timeout for acknowledgments in seconds
 BUFFER_CLEANUP_INTERVAL = 30.0  # Seconds between buffer cleanup
 MAX_BUFFER_AGE = 60.0  # Maximum age of buffered packets in seconds
 
-# Security constants
-CIPHER_SUITE_AES_256_GCM = 1
-KEY_EXCHANGE_ECDHE = 1
-AUTH_METHOD_PSK = 1
-AUTH_METHOD_CERTIFICATE = 2
-
-# Crypto parameters
-AES_KEY_SIZE = 32  # 256 bits
-HMAC_KEY_SIZE = 32  # 256 bits
-NONCE_SIZE = 12     # 96 bits for GCM
-EC_CURVE = ec.SECP384R1()  # P-384 curve
-KEY_ROTATION_INTERVAL = 3600  # Rotate keys every hour
-
 
 class MsgType(Enum):
     """Message types supported by the VPN protocol"""
@@ -77,6 +43,12 @@ class MsgType(Enum):
     Ack = 10           # Acknowledgment
     Retransmit = 11    # Request for retransmission
     Mtu = 12           # MTU probe or response
+    Login = 13         # Login request
+    LoginResponse = 14 # Login response
+    Signup = 15        # Signup request
+    SignupResponse = 16 # Signup response
+    KeyExchangeInit = 17   # Client initiates key exchange
+    KeyExchangeResponse = 18  # Server responds to key exchange
 
 
 class PacketFlags(Enum):
@@ -117,22 +89,22 @@ class MessageHandler():
         self.magic_number = MAGIC_NUMBER
         self.version = PROTOCOL_VERSION
         self.client_id = client_id or self._generate_client_id()
+
+        self.crypto = VPNCrypto()
+        self.encrypted = False
         
         # Sequence tracking
         self.next_seq_num = random.randint(1, 10000)
         self.expected_seq_num = 0
         
-        # For the server to track multiple clients
         self.client_seq_nums = {}  # addr -> {'seq': next_seq, 'expected': expected_seq}
         self.seq_to_client = {}    # seq_num -> addr (for message routing)
         
-        # MTU discovery
         self.current_mtu = MAX_PACKET_SIZE
         
         # Buffer for out-of-order packets
         self.packet_buffer = {}  # key -> (packet_data, timestamp)
         
-        # Packet delivery callback
         self.packet_send_callback = None
 
     def _generate_client_id(self) -> str:
@@ -168,8 +140,6 @@ class MessageHandler():
             if now - timestamp > MAX_BUFFER_AGE:
                 del self.packet_buffer[key]
                 logger.debug(f"Removed stale buffered packet {key}")
-    
-    # [RELIABILITY REMOVED] No more check_retransmissions method
 
     def _create_header(self, msg_type: MsgType, seq_num: int, 
                        ack_num: int = 0, flags: int = 0, payload_length: int = 0) -> bytes:
@@ -198,31 +168,32 @@ class MessageHandler():
     
 
     def create_packet(self, msg_type: MsgType, payload: bytes = b'', 
-                     ack_num: int = 0, flags: int = 0, client_addr: tuple = None) -> bytes:
-        """
-        Create a complete packet with header, payload, and checksum
-        
-        Args:
-            msg_type: Type of message
-            payload: Payload data
-            ack_num: Acknowledgment number
-            flags: Packet flags
-            client_addr: (ip, port) tuple of client for server-side use
-            
-        Returns:
-            Complete packet as bytes
-        """
+                 ack_num: int = 0, flags: int = 0, client_addr: tuple = None) -> bytes:
+        """Create a packet with optional encryption"""
         # Get appropriate sequence number
         if client_addr and self.role == 'server' and client_addr in self.client_seq_nums:
             seq_num = self.client_seq_nums[client_addr]['seq']
-            # Track sequence number to client mapping
             self.seq_to_client[seq_num] = client_addr
-            # Increment sequence number for next packet
             self.client_seq_nums[client_addr]['seq'] += 1
         else:
             seq_num = self.next_seq_num
             self.next_seq_num += 1
         
+        encrypt_payload = (self.encrypted and msg_type != MsgType.KeyExchangeInit 
+                        and msg_type != MsgType.KeyExchangeResponse)
+        
+        if encrypt_payload and payload:
+            flags |= 0x100  # Encryption flag (bit 8)
+            
+            encrypted_payload = self.crypto.encrypt(payload)
+            if encrypted_payload is None:
+                logger.error(f"Encryption failed for message type {msg_type}")
+                encrypted_payload = payload
+                flags &= ~0x100  # Clear encryption flag
+            else:
+                payload = encrypted_payload
+        
+        # Create the header
         header = self._create_header(msg_type, seq_num, ack_num, flags, len(payload))
         
         # Calculate checksum over header + payload
@@ -232,22 +203,11 @@ class MessageHandler():
         # Add checksum to packet
         packet = packet_data + struct.pack('>I', checksum)
         
-        # [RELIABILITY REMOVED] No more tracking of unacked packets
-        
         return packet
     
     def parse_packet(self, packet_data: bytes) -> dict:
-        """
-        Parse a received packet
-        
-        Args:
-            packet_data: Raw packet data
-            
-        Returns:
-            Dictionary with parsed packet information or error
-        """
+        """Parse a packet with optional decryption"""
         try:
-            # Check minimum packet size
             if len(packet_data) < 21:  # Header (17) + Checksum (4)
                 return {'error': 'Packet too small'}
             
@@ -265,11 +225,9 @@ class MessageHandler():
             '>IBBIIBH', header[:17]
             )
             
-            # Verify magic number
+            # Verify magic number and version
             if magic != self.magic_number:
                 return {'error': 'Invalid magic number'}
-            
-            # Check protocol version
             if version != self.version:
                 return {'error': 'Protocol version mismatch'}
             
@@ -285,19 +243,28 @@ class MessageHandler():
                 msg_type = MsgType(msg_type)
             except ValueError:
                 return {'error': 'Invalid message type'}
+                
+            # Check if payload is encrypted (encryption flag set)
+            is_encrypted = (flags & 0x100) != 0
+            
+            # Decrypt payload if needed
+            if is_encrypted and self.encrypted and payload:
+                # Don't try to decrypt key exchange messages
+                if msg_type != MsgType.KeyExchangeInit and msg_type != MsgType.KeyExchangeResponse:
+                    decrypted_payload = self.crypto.decrypt(payload)
+                    if decrypted_payload is None:
+                        return {'error': 'Decryption failed'}
+                    payload = decrypted_payload
             
             # Return parsed packet information
-            result = {
+            return {
                 'type': msg_type,
                 'seq_num': seq_num,
                 'ack_num': ack_num,
                 'flags': flags,
-                'payload': payload  
+                'payload': payload,
+                'encrypted': is_encrypted
             }
-            
-            # [RELIABILITY REMOVED] No more processing of ACK flags
-            
-            return result
             
         except Exception as e:
             return {'error': f'Parsing error: {str(e)}'}
@@ -333,10 +300,8 @@ class MessageHandler():
         if self.role == 'client':
             expected = self.expected_seq_num
             if packet_info['seq_num'] > expected:
-                # Store out-of-order packet
                 self.packet_buffer[packet_info['seq_num']] = (packet_data, time.time())
                 
-                # [RELIABILITY REMOVED] No more retransmission requests
         elif self.role == 'server' and sender_addr in self.client_seq_nums:
             expected = self.client_seq_nums[sender_addr]['expected']
             if packet_info['seq_num'] > expected:
@@ -344,16 +309,12 @@ class MessageHandler():
                 client_addr_str = f"{sender_addr[0]}:{sender_addr[1]}"
                 buffer_key = f"{client_addr_str}_{packet_info['seq_num']}"
                 self.packet_buffer[buffer_key] = (packet_data, time.time())
-                
-                # [RELIABILITY REMOVED] No more retransmission requests
         
         # Update expected sequence number
         if self.role == 'client':
             self.expected_seq_num = packet_info['seq_num'] + 1
         elif self.role == 'server' and sender_addr in self.client_seq_nums:
             self.client_seq_nums[sender_addr]['expected'] = packet_info['seq_num'] + 1
-        
-        # [RELIABILITY REMOVED] No more sending acknowledgment for packets
         
         # Return processed packet info with default action
         return {**packet_info, 'action': 'process'}
@@ -391,7 +352,6 @@ class MessageHandler():
         client_info['client_id'] = self.client_id
         client_info['protocol_version'] = self.version
         
-        # Serialize client info to JSON
         payload = json.dumps(client_info).encode()
         
         # Create packet with SYN flag
@@ -542,8 +502,45 @@ class MessageHandler():
         """
         # Create a payload of the specified size
         probe_size = struct.pack('>I', size)
-        padding = b'\x00' * (size - 21 - 4)  # 21 for header + 4 for probe_size
+        padding = b'\x00' * (size - 21 - 4)  # 17 for header + 4 for probe_size
         payload = probe_size + padding
         
         return self.create_packet(MsgType.Mtu, payload, 
                                 flags=PacketFlags.MTU.value, client_addr=client_addr)
+    
+    def create_key_exchange_init_packet(self) -> bytes:
+        """Create a key exchange initialization packet (client -> server)"""
+        # Generate a new keypair
+        public_key = self.crypto.generate_keypair()
+        
+        # Create packet with public key as payload
+        return self.create_packet(MsgType.KeyExchangeInit, public_key)
+
+    def create_key_exchange_response_packet(self, client_public_key, client_addr=None) -> bytes:
+        """Create a key exchange response packet (server -> client)"""
+        # Set the peer's public key
+        self.crypto.set_peer_public_key(client_public_key)
+        
+        # Generate our keypair and get the public key bytes
+        public_key = self.crypto.generate_keypair()
+        
+        # Generate the shared key
+        self.crypto.generate_shared_key()
+        
+        self.encrypted = True
+        
+        return self.create_packet(MsgType.KeyExchangeResponse, public_key, client_addr=client_addr)
+
+    def handle_key_exchange_response(self, peer_public_key) -> bool:
+        """Process a key exchange response (client-side)"""
+        # Set the peer's public key
+        if not self.crypto.set_peer_public_key(peer_public_key):
+            return False
+        
+        # Generate the shared key
+        if not self.crypto.generate_shared_key():
+            return False
+        
+        # Enable encryption for future messages
+        self.encrypted = True
+        return True
