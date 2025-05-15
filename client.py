@@ -11,19 +11,13 @@ import json
 import time
 import subprocess
 import platform
-import traceback
 import time
 from queue import Queue, Empty
-from enum import Enum
-from typing import Optional, Tuple, Dict, Any, List
-from dataclasses import dataclass
-from protocol import MessageHandler, MsgType, PacketFlags, ConnectionState  
+from protocol import MsgType, ConnectionState
+from reliable_protocol import ReliableMessageHandler
 try:
     import fcntl
-    from scapy.all import Raw
     from scapy.layers.inet import ICMP, TCP, UDP, IP
-    from scapy.layers.l2 import Ether
-    from scapy.packet import Packet
 except ImportError:
     print("Please install the required dependencies:")
     print("pip install scapy")
@@ -43,12 +37,12 @@ IFF_TAP = 0x0002
 IFF_NO_PI = 0x1000
 
 # VPN configuration 
-VPN_MTU = 1400  # Reduced from 1500 to account for VPN encapsulation
+VPN_MTU = 1400  # VPN encapsulation accounted for
 VPN_MSS = 1340  # MSS should be lower than MTU (MTU - IP header - TCP header)
 KEEPALIVE_INTERVAL = 25  # Seconds
 CLIENT_TIMEOUT = 90  # Seconds
 
-SERVER_ADRESS = "10.68.121.209"
+SERVER_ADRESS = "192.168.68.118"
 SERVER_PORT = 1194
 
 
@@ -89,6 +83,10 @@ class VPNClient:
         
         # Authentication state
         self.auth_challenge = None
+
+        self.auth_token = None
+        self.auth_response_event = threading.Event()
+        self.last_auth_response = None
         
         # Message handler
         self.msg_handler = None
@@ -96,6 +94,16 @@ class VPNClient:
         # Connection events
         self.connected_event = threading.Event()
         self.authenticated_event = threading.Event()
+
+        self.encryption_ready_event = threading.Event()
+
+        self.key_exchange_in_progress = threading.Lock() 
+
+        self.state_lock = threading.RLock()
+
+    def _get_connection_state(self):
+        """Return the current connection state for the reliability mechanism"""
+        return self.connection_state
 
     def _subnet_mask_to_cidr(self, subnet_mask):
         """Convert a subnet mask (e.g. 255.255.255.0) to CIDR prefix length (e.g. 24)"""
@@ -319,7 +327,6 @@ class VPNClient:
             os.system("ip rule add from all lookup main pref 32766")
             os.system("ip rule add from all lookup default pref 32767")
             
-            # Create VPN routing table
             # Default route via VPN server's virtual IP
             os.system(f"ip route add default via {self.server_virtual_ip} dev {self.virtual_interface} table 200")
             
@@ -352,7 +359,6 @@ class VPNClient:
             os.system(f"iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {VPN_MSS}")
             os.system(f"iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu")
             
-            # *** ADDED: ENSURE PROPER CONNECTION TRACKING ***
             # Accept established and related connections
             os.system(f"iptables -A INPUT -i {self.virtual_interface} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT")
             os.system(f"iptables -A OUTPUT -o {self.virtual_interface} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT")
@@ -368,7 +374,6 @@ class VPNClient:
             os.system("sysctl -w net.ipv4.conf.all.send_redirects=0")
             os.system("sysctl -w net.ipv4.conf.all.accept_redirects=0")
             
-            # *** CRITICAL: Disable reverse path filtering on the VPN interface ***
             # This ensures packets with "asymmetric routing" aren't dropped
             os.system(f"sysctl -w net.ipv4.conf.{self.virtual_interface}.rp_filter=0")
             os.system("sysctl -w net.ipv4.conf.all.rp_filter=0")
@@ -517,20 +522,24 @@ class VPNClient:
             return
         
         try:
-            self.msg_handler = MessageHandler('client')
-
+            # Use the reliable message handler instead
+            self.msg_handler = ReliableMessageHandler('client')
+            
+            # Register the connection state callback - THIS IS CRUCIAL
+            self.msg_handler.connection_state_callback = self._get_connection_state
+            
             self.external_interface_ip = self._get_external_ip()
-
+            
             logger.info(f"Using real IP address: {self.external_interface_ip}")
-
+            
             self._set_up_tun()
             self._set_up_socket()
-
+            
             # Set up the message handler with a packet send callback that uses the write queue
             self.msg_handler.register_packet_callback(
                 lambda packet: self.udp_write_queue.put(packet)
             )
-
+            
             self.running.set()
             logger.info("VPN client started successfully")
         except Exception as e:
@@ -557,6 +566,10 @@ class VPNClient:
         
         # Signal all threads to stop
         self.running.clear()
+        
+        # Stop the reliability worker thread
+        if hasattr(self, 'msg_handler') and hasattr(self.msg_handler, 'stop'):
+            self.msg_handler.stop()
         
         # Wait for threads to stop
         for thread in self.threads:
@@ -618,14 +631,12 @@ class VPNClient:
                 logger.error(f"Error in UDP read loop: {e}")
                 time.sleep(0.1)  # Avoid spinning too fast on errors
 
-    
     def _udp_packet_processor(self):
         """Process packets received from the server via UDP"""
         logger.info("UDP packet processor started")
         
         while self.running.is_set():
             try:
-
                 data, addr = self.udp_read_queue.get(timeout=0.1)
                 server_ip, server_port = addr
                 
@@ -649,8 +660,25 @@ class VPNClient:
                 # Get the message type
                 msg_type = packet_info.get('type')
                 
-                # Handle the packet based on its type
-                if msg_type == MsgType.Authenticate:
+                # Handle key exchange response first
+                if msg_type == MsgType.KeyExchangeResponse:
+                    logger.info("Received key exchange response from server")
+                    if self.msg_handler.handle_key_exchange_response(packet_info['payload']):
+                        logger.info("Key exchange completed successfully")
+                        self.encryption_ready_event.set()
+                        self.msg_handler.encrypted = True
+                    else:
+                        logger.error("Key exchange failed")
+                        self.connection_state = ConnectionState.ERROR
+                
+                # Handle other message types as before
+                elif msg_type == MsgType.LoginResponse:
+                    self._handle_login_response(packet_info)
+                    
+                elif msg_type == MsgType.SignupResponse:
+                    self._handle_signup_response(packet_info)
+                    
+                elif msg_type == MsgType.Authenticate:
                     self._handle_auth_challenge(packet_info)
                     
                 elif msg_type == MsgType.Config:
@@ -684,7 +712,6 @@ class VPNClient:
                 self.udp_read_queue.task_done()
                 
             except Empty:
-                # No data available, just continue
                 time.sleep(0.1)
                 continue
             except Exception as e:
@@ -693,7 +720,6 @@ class VPNClient:
                     import traceback
                     logger.error(traceback.format_exc())
                     time.sleep(0.1)
-
 
     def _udp_write_worker(self):
         """Worker thread to send packets to the server via UDP"""
@@ -775,33 +801,6 @@ class VPNClient:
                     logger.error(f"Error in TUN read worker: {e}")
                     import traceback
                     logger.error(traceback.format_exc())
-                    time.sleep(0.1)
-
-
-    def _tun_write_worker(self):
-        """Worker thread to write packets from the queue to the TUN interface"""
-        logger.info("TUN write worker started")
-        while self.running.is_set():
-            try:
-                # Get the next packet with a timeout for interruptibility
-                data, addr = self.udp_to_tun_queue.get(timeout=0.5)
-                
-                # Process the received packet (authentication, etc.)
-                tun_packet = self._process_client_packet(data, addr)
-                
-                if tun_packet:
-                    # Write to TUN interface
-                    os.write(self.tun_fd, tun_packet)
-                
-                # Mark task as done
-                self.udp_to_tun_queue.task_done()
-                
-            except Empty:
-                time.sleep(0.1)
-                continue
-            except Exception as e:
-                if self.running.is_set():
-                    logger.error(f"Error in TUN write worker: {e}")
                     time.sleep(0.1)
 
     def _connection_manager_worker(self):
@@ -887,60 +886,112 @@ class VPNClient:
     # === Server Handling Start ===
     #==============================
 
+    def _handle_login_response(self, packet_info):
+        """Handle login response from server"""
+        try:
+            response_data = json.loads(packet_info['payload'].decode())
+            self.last_auth_response = response_data
+            
+            if response_data['success']:
+                self.auth_token = response_data.get('session_token')
+                logger.info("Login successful")
+            else:
+                logger.warning(f"Login failed: {response_data.get('message', 'Unknown error')}")
+            
+            if hasattr(self, 'auth_response_event'):
+                self.auth_response_event.set()
+                
+        except Exception as e:
+            logger.error(f"Error handling login response: {e}")
+
+    def _handle_signup_response(self, packet_info):
+        """Handle signup response from server"""
+        try:
+            response_data = json.loads(packet_info['payload'].decode())
+            self.last_auth_response = response_data
+            
+            if response_data['success']:
+                logger.info("Signup successful")
+            else:
+                logger.warning(f"Signup failed: {response_data.get('message', 'Unknown error')}")
+            
+            if hasattr(self, 'auth_response_event'):
+                self.auth_response_event.set()
+                
+        except Exception as e:
+            logger.error(f"Error handling signup response: {e}")
+
     def connect_to_server(self, timeout=30):
-        """
-        Initiate connection to the VPN server and wait for it to complete
-        
-        Returns:
-            bool: True if connection was successful, False otherwise
-        """
+        """Initiate VPN connection (requires encryption and authentication)"""
         if self.connection_state == ConnectionState.CONNECTED:
             logger.info("Already connected to server")
             return True
+        
+        if not hasattr(self.msg_handler, 'encrypted') or not self.msg_handler.encrypted:
+            logger.error("Cannot connect: Encryption not established")
+            return False
+            
+        if not hasattr(self, 'auth_token') or not self.auth_token:
+            logger.error("Cannot connect: Not authenticated")
+            return False
         
         self.connected_event.clear()
         self.authenticated_event.clear()
         
         self.connection_state = ConnectionState.CONNECTING
         
-        try:
-            client_info = {
-                'protocol_version': 1,
-                'client_version': '1.0',
-                'platform': platform.system(),
-                'capabilities': ['compression', 'encryption']
-            }
-            
-            request_packet = self.msg_handler.create_request_packet(client_info)
-            self.udp_write_queue.put(request_packet)
-            
-            logger.info(f"Sent connection request to {self.server_address}:{self.server_port}")
-            
-            if self.connected_event.wait(timeout):
-                logger.info("Connected to server successfully")
-                return True
-            else:
-                logger.error("Connection timed out")
-                self.connection_state = ConnectionState.DISCONNECTED
-                return False
-            
-        except Exception as e:
-            logger.error(f"Error connecting to server: {e}")
+        client_info = {
+            'protocol_version': 1,
+            'client_version': '1.0',
+            'platform': platform.system(),
+            'capabilities': ['encryption'],
+            'client_id': self.msg_handler.client_id
+        }
+        
+        request_packet = self.msg_handler.create_packet(
+            MsgType.Request,
+            json.dumps(client_info).encode()
+        )
+        
+        self.udp_write_queue.put(request_packet)
+        
+        logger.info(f"Sent connection request to {self.server_address}:{self.server_port}")
+        
+        if self.connected_event.wait(timeout):
+            logger.info("Connected to server successfully")
+            return True
+        else:
+            logger.error("Connection timed out")
             self.connection_state = ConnectionState.DISCONNECTED
             return False
         
     def _handle_auth_challenge(self, packet_info):
         """Handle an authentication challenge from the server"""
         try:
-            if self.connection_state != ConnectionState.CONNECTING:
-                logger.warning("Received authentication challenge in unexpected state")
+            # Check if we're in the right state for receiving an auth challenge
+            if self.connection_state == ConnectionState.CONNECTED:
+                logger.info("Already connected, ignoring authentication challenge")
                 return
-            
-            self.connection_state = ConnectionState.AUTHENTICATING
+                
+            # Check for duplicate auth challenge in an unexpected state
+            if self.msg_handler._state_is_advanced(self.connection_state, ConnectionState.AUTHENTICATING):
+                logger.warning(f"Received authentication challenge in unexpected state: {self.connection_state}")
+                
+                if self.msg_handler._state_is_advanced_or_equal(self.connection_state, ConnectionState.ESTABLISHING):
+                    return
+                    
+                logger.info("Resetting state to handle authentication challenge")
             
             self.auth_challenge = packet_info['payload']
             
-            auth_response = self.msg_handler.create_auth_response_packet(self.auth_challenge)
+            self.connection_state = ConnectionState.AUTHENTICATING
+            
+            auth_response = self.msg_handler.create_packet(
+                MsgType.AuthResponse, 
+                self.auth_challenge,
+                current_state=ConnectionState.AUTHENTICATING,
+                target_state=ConnectionState.ESTABLISHING
+            )
             
             self.udp_write_queue.put(auth_response)
             
@@ -953,35 +1004,44 @@ class VPNClient:
     def _handle_config(self, packet_info):
         """Handle configuration packet from the server"""
         try:
-            # Check if we're in the correct state
+            # Check if we're in the right state
             if self.connection_state != ConnectionState.AUTHENTICATING:
                 logger.warning("Received config packet in unexpected state")
                 return
             
-            # Parse the configuration data
-            config_json = packet_info['payload']
-            try:
-                # Convert bytes to string and parse JSON
-                config = json.loads(config_json.decode('utf-8'))
-                logger.info(f"Received configuration packet from server:\n{config}")
+            with self.state_lock:
+                # Parse the configuration data
+                config_json = packet_info['payload']
+                try:
+                    # Convert bytes to string and parse JSON
+                    config = json.loads(config_json.decode('utf-8'))
+                    logger.info(f"Received configuration packet from server:\n{config}")
+                    
+                    # Configure the TUN interface with the received settings
+                    self._configure_tun(config)
+                except json.JSONDecodeError:
+                    logger.error("Failed to parse configuration JSON")
+                    self.connection_state = ConnectionState.ERROR
+                    return
                 
-                # Configure the TUN interface with the received settings
-                self._configure_tun(config)
-            except json.JSONDecodeError:
-                logger.error("Failed to parse configuration JSON")
-                self.connection_state = ConnectionState.ERROR
-                return
-            
-            # Send establish packet to confirm configuration received
-            establish_packet = self.msg_handler.create_establish_packet()
-            self.udp_write_queue.put(establish_packet)
-            logger.info("Sent establish confirmation to server")
-            
-            # Update state AFTER sending establish packet
-            self.connection_state = ConnectionState.CONNECTED
-            
-            # Set the connected event
-            self.connected_event.set()
+                # Update connection state BEFORE sending establish
+                self.connection_state = ConnectionState.ESTABLISHING
+                
+                # Send establish packet with state info to confirm configuration received
+                establish_packet = self.msg_handler.create_packet(
+                    MsgType.Establish,
+                    current_state=ConnectionState.ESTABLISHING,
+                    target_state=ConnectionState.CONNECTED
+                )
+                
+                self.udp_write_queue.put(establish_packet)
+                logger.info("Sent establish confirmation to server")
+                
+                # Update state to CONNECTED after sending establish
+                self.connection_state = ConnectionState.CONNECTED
+                
+                # Set the connected event
+                self.connected_event.set()
             
             logger.info("VPN client configured and connected to server")
             
@@ -1001,38 +1061,31 @@ class VPNClient:
             try:
                 ip_packet = IP(encapsulated_data)
                 
-                # Track if packet needs modification
                 modified = False
                 
-                # Validate the destination is actually our virtual IP
-                # Don't modify destination - it might be broadcast or multicast traffic
+                # Validate the destination
                 if ip_packet.dst != self.virtual_ip and not ip_packet.dst.startswith('255.'):
                     logger.warning(f"Received packet destined for {ip_packet.dst} but our VPN IP is {self.virtual_ip}")
                 
-                # Ensure TTL is reasonable to prevent premature packet drops
                 if ip_packet.ttl < 10:
                     ip_packet.ttl = 64
                     logger.debug(f"Adjusted TTL to 64 for packet from {ip_packet.src} to {ip_packet.dst}")
                     modified = True
                 
-                # Special handling for TCP packets
                 if TCP in ip_packet:
                     tcp_packet = ip_packet[TCP]
                     
-                    # Check if it's a SYN packet with an MSS option
                     if tcp_packet.flags & 0x02:  # SYN flag
                         for i, option in enumerate(tcp_packet.options):
                             if option[0] == 'MSS':
                                 current_mss = option[1]
                                 if current_mss > VPN_MSS:
-                                    # Update the MSS option
                                     new_options = list(tcp_packet.options)
                                     new_options[i] = ('MSS', VPN_MSS)
                                     tcp_packet.options = new_options
                                     modified = True
                                     logger.info(f"Updated SYN packet MSS from {current_mss} to {VPN_MSS}")
                     
-                    # Log TCP-specific details
                     tcp_flags = tcp_packet.flags
                     flag_str = []
                     if tcp_flags & 0x02: flag_str.append("SYN")
